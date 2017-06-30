@@ -744,6 +744,11 @@ CONFIG_NET_IPVTI=y
 CONFIG_HID_SONY=y
 
 #
+# ResurrectedKernel Extra
+#
+CONFIG_IOSCHED_MAPLE=y
+
+#
 # Qualcomm Atheros CLD WLAN module
 #
 CONFIG_QCA_CLD_WLAN=m
