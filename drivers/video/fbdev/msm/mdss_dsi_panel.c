@@ -22,6 +22,7 @@
 #include <linux/leds.h>
 #include <linux/qpnp/pwm.h>
 #include <linux/err.h>
+#include <linux/display_state.h>
 #include <linux/string.h>
 #include <linux/mdss_io_util.h>
 
@@ -49,6 +50,14 @@
 
 
 DEFINE_LED_TRIGGER(bl_led_trigger);
+
+bool display_on = true;
+
+bool is_display_on()
+{
+	return display_on;
+}
+
 static bool mdss_panel_reset_skip;
 static struct mdss_panel_info *mdss_pinfo;
 
