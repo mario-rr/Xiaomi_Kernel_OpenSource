@@ -46,3 +46,16 @@
 	qcom,fs-curr-ua = <25000>;
 	qcom,led-strings-list = [00 01];
 };
+
+&firmware {
+     android {
+         fstab {
+            system {
+                fsmgr_flags = "wait";
+            };
+	        vendor {
+                fsmgr_flags = "wait";
+            };
+        };
+    };
+};
