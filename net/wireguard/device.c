@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2015-2018 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  */
 
 #include "queueing.h"
@@ -94,7 +94,7 @@ static int wg_pm_notification(struct notifier_block *nb, unsigned long action,
 		mutex_unlock(&wg->device_update_lock);
 	}
 	rtnl_unlock();
-	rcu_barrier_bh();
+	rcu_barrier();
 	return 0;
 }
 
@@ -112,9 +112,7 @@ static int wg_stop(struct net_device *dev)
 		wg_timers_stop(peer);
 		wg_noise_handshake_clear(&peer->handshake);
 		wg_noise_keypairs_clear(&peer->keypairs);
-		atomic64_set(&peer->last_sent_handshake,
-			     ktime_get_boot_fast_ns() -
-				     (u64)(REKEY_TIMEOUT + 1) * NSEC_PER_SEC);
+		wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake);
 	}
 	mutex_unlock(&wg->device_update_lock);
 	skb_queue_purge(&wg->incoming_handshakes);
@@ -132,7 +130,7 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 	u32 mtu;
 	int ret;
 
-	if (unlikely(wg_skb_examine_untrusted_ip_hdr(skb) != skb->protocol)) {
+	if (unlikely(!wg_check_packet_protocol(skb))) {
 		ret = -EPROTONOSUPPORT;
 		net_dbg_ratelimited("%s: Invalid IP packet\n", dev->name);
 		goto err;
@@ -162,7 +160,7 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	__skb_queue_head_init(&packets);
 	if (!skb_is_gso(skb)) {
-		skb->next = NULL;
+		skb_mark_not_on_list(skb);
 	} else {
 		struct sk_buff *segs = skb_gso_segment(skb, 0);
 
@@ -173,9 +171,9 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 		dev_kfree_skb(skb);
 		skb = segs;
 	}
-	do {
-		next = skb->next;
-		skb->next = skb->prev = NULL;
+
+	skb_list_walk_safe(skb, skb, next) {
+		skb_mark_not_on_list(skb);
 
 		skb = skb_share_check(skb, GFP_ATOMIC);
 		if (unlikely(!skb))
@@ -189,7 +187,7 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
 		PACKET_CB(skb)->mtu = mtu;
 
 		__skb_queue_tail(&packets, skb);
-	} while ((skb = next) != NULL);
+	}
 
 	spin_lock_bh(&peer->staged_packet_queue.lock);
 	/* If the queue is getting too big, we start removing the oldest packets
@@ -213,9 +211,9 @@ err_peer:
 err:
 	++dev->stats.tx_errors;
 	if (skb->protocol == htons(ETH_P_IP))
-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH, 0);
+		icmp_ndo_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH, 0);
 	else if (skb->protocol == htons(ETH_P_IPV6))
-		icmpv6_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_ADDR_UNREACH, 0);
+		icmpv6_ndo_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_ADDR_UNREACH, 0);
 	kfree_skb(skb);
 	return ret;
 }
@@ -237,7 +235,6 @@ static void wg_destruct(struct net_device *dev)
 	mutex_lock(&wg->device_update_lock);
 	wg->incoming_port = 0;
 	wg_socket_reinit(wg, NULL, NULL);
-	wg_allowedips_free(&wg->peer_allowedips, &wg->device_update_lock);
 	/* The final references are cleared in the below calls to destroy_workqueue. */
 	wg_peer_remove_all(wg);
 	destroy_workqueue(wg->handshake_receive_wq);
@@ -245,7 +242,7 @@ static void wg_destruct(struct net_device *dev)
 	destroy_workqueue(wg->packet_crypt_wq);
 	wg_packet_queue_free(&wg->decrypt_queue, true);
 	wg_packet_queue_free(&wg->encrypt_queue, true);
-	rcu_barrier_bh(); /* Wait for all the peers to be actually freed. */
+	rcu_barrier(); /* Wait for all the peers to be actually freed. */
 	wg_ratelimiter_uninit();
 	memzero_explicit(&wg->static_identity, sizeof(wg->static_identity));
 	skb_queue_purge(&wg->incoming_handshakes);
@@ -253,6 +250,8 @@ static void wg_destruct(struct net_device *dev)
 	free_percpu(wg->incoming_handshakes_worker);
 	if (wg->have_creating_net_ref)
 		put_net(wg->creating_net);
+	kvfree(wg->index_hashtable);
+	kvfree(wg->peer_hashtable);
 	mutex_unlock(&wg->device_update_lock);
 
 	pr_debug("%s: Interface deleted\n", dev->name);
@@ -267,6 +266,8 @@ static void wg_setup(struct net_device *dev)
 	enum { WG_NETDEV_FEATURES = NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
 				    NETIF_F_SG | NETIF_F_GSO |
 				    NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA };
+	const int overhead = MESSAGE_MINIMUM_LENGTH + sizeof(struct udphdr) +
+			     max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
 
 	dev->netdev_ops = &netdev_ops;
 	dev->hard_header_len = 0;
@@ -284,9 +285,10 @@ static void wg_setup(struct net_device *dev)
 	dev->features |= WG_NETDEV_FEATURES;
 	dev->hw_features |= WG_NETDEV_FEATURES;
 	dev->hw_enc_features |= WG_NETDEV_FEATURES;
-	dev->mtu = ETH_DATA_LEN - MESSAGE_MINIMUM_LENGTH -
-		   sizeof(struct udphdr) -
-		   max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
+	dev->mtu = ETH_DATA_LEN - overhead;
+#ifndef COMPAT_CANNOT_USE_MAX_MTU
+	dev->max_mtu = round_down(INT_MAX, MESSAGE_PADDING_MULTIPLE) - overhead;
+#endif
 
 	SET_NETDEV_DEVTYPE(dev, &device_type);
 
@@ -309,19 +311,25 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	mutex_init(&wg->socket_update_lock);
 	mutex_init(&wg->device_update_lock);
 	skb_queue_head_init(&wg->incoming_handshakes);
-	wg_pubkey_hashtable_init(&wg->peer_hashtable);
-	wg_index_hashtable_init(&wg->index_hashtable);
 	wg_allowedips_init(&wg->peer_allowedips);
 	wg_cookie_checker_init(&wg->cookie_checker, wg);
 	INIT_LIST_HEAD(&wg->peer_list);
 	wg->device_update_gen = 1;
 
-	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
-	if (!dev->tstats)
+	wg->peer_hashtable = wg_pubkey_hashtable_alloc();
+	if (!wg->peer_hashtable)
 		return ret;
 
+	wg->index_hashtable = wg_index_hashtable_alloc();
+	if (!wg->index_hashtable)
+		goto err_free_peer_hashtable;
+
+	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
+	if (!dev->tstats)
+		goto err_free_index_hashtable;
+
 	wg->incoming_handshakes_worker =
-		wg_packet_alloc_percpu_multicore_worker(
+		wg_packet_percpu_multicore_worker_alloc(
 				wg_packet_handshake_receive_worker, wg);
 	if (!wg->incoming_handshakes_worker)
 		goto err_free_tstats;
@@ -385,6 +393,10 @@ err_free_incoming_handshakes:
 	free_percpu(wg->incoming_handshakes_worker);
 err_free_tstats:
 	free_percpu(dev->tstats);
+err_free_index_hashtable:
+	kvfree(wg->index_hashtable);
+err_free_peer_hashtable:
+	kvfree(wg->peer_hashtable);
 	return ret;
 }
 
@@ -457,5 +469,5 @@ void wg_device_uninit(void)
 #ifdef CONFIG_PM_SLEEP
 	unregister_pm_notifier(&pm_notifier);
 #endif
-	rcu_barrier_bh();
+	rcu_barrier();
 }
